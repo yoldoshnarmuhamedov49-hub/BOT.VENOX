@@ -1,0 +1,341 @@
+import asyncio, os, sqlite3, time, logging
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
+                          InlineKeyboardMarkup, InlineKeyboardButton)
+
+# ================= SOZLAMALAR =================
+TOKEN = "8793079409:AAHtAfLWlEDhK3S_Byi7rKVcBJzJhW68PGM"
+ADMIN_ID = 8527026238
+ADMIN_PASSWORD = "robux2012"
+CARD, CARD_OWNER, CONTACT, MIN_TOPUP = "5614 6830 1549 1525", "D*N", "+998771130301", 5000
+ADMIN_USERNAME = "VENOX_Uz1" # Sening Telegram username'ing
+
+CATALOG = {
+    "stars": ("🌟 Telegram Stars", "Stars qaysi Telegram @username ga yuborilsin?",
+        [("100 yulduz", 27399), ("150 yulduz", 38999), ("250 yulduz", 61999), ("350 yulduz", 85999),
+         ("500 yulduz", 119999), ("750 yulduz", 177999), ("1 000 yulduz", 235999),
+         ("1 500 yulduz", 351999), ("2 500 yulduz", 581999), ("5 000 yulduz", 1161999),
+         ("10 000 yulduz", 2301999), ("25 000 yulduz", 5801999), ("50 000 yulduz", 11601999)]),
+    "robux": ("🎮 Robux", "Roblox username (va kerak bo'lsa qo'shimcha ma'lumot) yozing:",
+        [("40 Robux", 8000), ("80 Robux", 14000), ("120 Robux", 22000), ("160 Robux", 28000),
+         ("200 Robux", 36000), ("240 Robux", 42000), ("280 Robux", 50000), ("320 Robux", 57000),
+         ("360 Robux", 64000), ("500 Robux", 66000), ("540 Robux", 74000), ("580 Robux", 80000),
+         ("620 Robux", 88000), ("660 Robux", 95000), ("700 Robux", 101000), ("740 Robux", 108000),
+         ("780 Robux", 115000), ("1000 Robux", 133000)]),
+    "plus": ("🎖 Roblox Plus", "Roblox username va parol (yoki Quick sign in ma'lumotlarini) yozing:",
+        [("Roblox Plus", 66000), ("500 Plus", 120000), ("1000 Plus", 170000), ("2000 Plus", 285000)]),
+}
+
+logging.basicConfig(level=logging.INFO)
+db = sqlite3.connect("store.db"); db.row_factory = sqlite3.Row
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, username TEXT, balance INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS topups(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, status TEXT DEFAULT 'kutilmoqda', ts REAL);
+CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item TEXT, price INTEGER, target TEXT, status TEXT DEFAULT 'kutilmoqda', ts REAL);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+""")
+
+def get_setting(k, d="1"):
+    r = db.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+    return r["value"] if r else d
+
+def set_setting(k, v):
+    db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v))); db.commit()
+
+bot_is_on = lambda: get_setting("bot_on") == "1"
+user = lambda uid: db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+is_blocked = lambda uid: bool(user(uid) and user(uid)["blocked"])
+fmt = lambda n: f"{int(n):,}".replace(",", " ")
+addbal = lambda uid, n: (db.execute("UPDATE users SET balance=balance+? WHERE id=?", (n, uid)), db.commit())
+
+class Topup(StatesGroup): amount, receipt = State(), State()
+class Buy(StatesGroup): target = State()
+class AdminAuth(StatesGroup): password = State()
+class AdminFlow(StatesGroup): broadcast, block_id, unblock_id = State(), State(), State()
+
+MENU = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+    [KeyboardButton(text="⭐ Telegram Premium"), KeyboardButton(text="🌟 Telegram Stars")],
+    [KeyboardButton(text="🎮 Robux"), KeyboardButton(text="🎖 Roblox Plus")],
+    [KeyboardButton(text="💳 Balans to'ldirish"), KeyboardButton(text="👤 Balansim")],
+    [KeyboardButton(text="📞 Aloqa")]])
+CAT_BY_TITLE = {v[0]: k for k, v in CATALOG.items()}
+
+bot, dp = Bot(TOKEN), Dispatcher(storage=MemoryStorage())
+
+@dp.message.outer_middleware()
+async def gate_messages(handler, event: Message, data):
+    uid = event.from_user.id
+    if uid == ADMIN_ID: return await handler(event, data)
+    if is_blocked(uid): return await event.answer("⛔ Siz botdan foydalanishdan bloklangansiz.")
+    if not bot_is_on(): return await event.answer("🔧 Bot vaqtincha texnik ishlar uchun o'chirilgan.")
+    return await handler(event, data)
+
+@dp.callback_query.outer_middleware()
+async def gate_callbacks(handler, event: CallbackQuery, data):
+    uid = event.from_user.id
+    if uid == ADMIN_ID: return await handler(event, data)
+    if is_blocked(uid): return await event.answer("⛔ Siz bloklangansiz.", show_alert=True)
+    if not bot_is_on(): return await event.answer("🔧 Bot vaqtincha o'chirilgan.", show_alert=True)
+    return await handler(event, data)
+
+@dp.message(CommandStart())
+async def start(m: Message, state: FSMContext):
+    await state.clear()
+    if not user(m.from_user.id):
+        db.execute("INSERT INTO users(id,name,username) VALUES(?,?,?)", (m.from_user.id, m.from_user.full_name, m.from_user.username)); db.commit()
+    await m.answer("📱 VENOX STORE ga xush kelibsiz!\nKerakli bo'limni tanlang 👇", reply_markup=MENU)
+
+@dp.message(F.text == "👤 Balansim")
+async def balance(m: Message, state: FSMContext):
+    await state.clear(); u = user(m.from_user.id)
+    await m.answer(f"👤 ID: {u['id']}\n💰 Balans: {fmt(u['balance'])} so'm")
+
+@dp.message(F.text == "📞 Aloqa")
+async def contact(m: Message, state: FSMContext):
+    await state.clear(); await m.answer(f"📞 Aloqa: {CONTACT}")
+
+# Telegram Premium bosilganda tayyor matn bilan shaxsiy chatga o'tish tugmasi
+@dp.message(F.text == "⭐ Telegram Premium")
+async def premium_info(m: Message, state: FSMContext):
+    await state.clear()
+    # Foydalanuvchi bosganda avtomatik matn yozilib turadigan havola
+    pre_text = "Assalomu alaykum menga Telegram Premium kerak"
+    url = f"https://t.me/{ADMIN_USERNAME}?text={pre_text.replace(' ', '%20')}"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 Shaxsiy chatga o'tish", url=url)
+    ]])
+    await m.answer(
+        "⭐ **Telegram Premium** xarid qilish uchun shaxsiy chatga o'ting!\n\n"
+        "Tugmani bossangiz, adminga yuboriladigan xabar tayyor turadi.",
+        reply_markup=kb, parse_mode="Markdown"
+    )
+
+@dp.message(F.text.in_(CAT_BY_TITLE.keys()))
+async def category(m: Message, state: FSMContext):
+    await state.clear()
+    key = CAT_BY_TITLE[m.text]; title, _, items = CATALOG[key]
+    rows = [[InlineKeyboardButton(text=f"{n} — {fmt(p)} so'm", callback_data=f"item_{key}_{i}")] for i, (n, p) in enumerate(items)]
+    await m.answer(f"{title} narxlari:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.callback_query(F.data.startswith("item_"))
+async def pick(c: CallbackQuery, state: FSMContext):
+    _, key, i = c.data.split("_"); i = int(i)
+    name, price = CATALOG[key][2][i]; u = user(c.from_user.id)
+    if u["balance"] < price:
+        await c.message.answer(f"❌ Balans yetarli emas.\nKerak: {fmt(price)} so'm\nSizda: {fmt(u['balance'])} so'm\n💳 Balans to'ldirish tugmasini bosing.")
+        return await c.answer()
+    await state.set_state(Buy.target); await state.update_data(key=key, i=i)
+    await c.message.answer(f"🛒 {name} — {fmt(price)} so'm\n\n{CATALOG[key][1]}"); await c.answer()
+
+@dp.message(Buy.target, F.text)
+async def target(m: Message, state: FSMContext):
+    d = await state.get_data(); key = d["key"]
+    name, price = CATALOG[key][2][d["i"]]
+    await state.update_data(target=m.text[:200])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="buy_ok"), InlineKeyboardButton(text="❌ Bekor", callback_data="buy_no")]])
+    await m.answer(f"Buyurtmani tasdiqlang:\n📦 {name}\n💵 {fmt(price)} so'm\n👤 {m.text[:200]}", reply_markup=kb)
+
+@dp.callback_query(F.data == "buy_no")
+async def buy_no(c: CallbackQuery, state: FSMContext):
+    await state.clear(); await c.message.edit_text("Bekor qilindi."); await c.answer()
+
+@dp.callback_query(F.data == "buy_ok")
+async def buy_ok(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if "target" not in d: return await c.answer()
+    await state.clear(); name, price = CATALOG[d["key"]][2][d["i"]]; u = user(c.from_user.id)
+    if u["balance"] < price: return await c.answer("Balans yetarli emas", show_alert=True)
+    addbal(u["id"], -price)
+    cur = db.execute("INSERT INTO orders(user_id,item,price,target,ts) VALUES(?,?,?,?,?)", (u["id"], f"{CATALOG[d['key']][0]} · {name}", price, d["target"], time.time())); db.commit()
+    await c.message.edit_text(f"✅ Buyurtma #{cur.lastrowid} qabul qilindi!\nTez orada bajariladi.")
+    await bot.send_message(ADMIN_ID, f"🆕 Buyurtma #{cur.lastrowid}\n👤 {u['name']} (@{u['username']}, id {u['id']})\n📦 {CATALOG[d['key']][0]} · {name}\n💵 {fmt(price)} so'm\n🎯 {d['target']}\n\nBajarilgach: /done {cur.lastrowid}")
+    await c.answer()
+
+@dp.message(F.text == "💳 Balans to'ldirish")
+async def topup_start(m: Message, state: FSMContext):
+    await state.set_state(Topup.amount)
+    await m.answer(f"Qancha to'ldirmoqchisiz? Summani raqamda yozing (kamida {fmt(MIN_TOPUP)} so'm):")
+
+@dp.message(Topup.amount, F.text)
+async def topup_amount(m: Message, state: FSMContext):
+    t = m.text.replace(" ", "")
+    if not t.isdigit() or int(t) < MIN_TOPUP: return await m.answer(f"Iltimos, {fmt(MIN_TOPUP)} dan katta raqam yozing.")
+    await state.update_data(amount=int(t)); await state.set_state(Topup.receipt)
+    await m.answer(f"💳 Karta Uzcard:\n<code>{CARD}</code>\n📌 {CARD_OWNER}\n\nTo'lang: {fmt(t)} so'm\n‼️ To'lagach CHEK (skrinshot) rasmini shu yerga yuboring.\nCheksiz to'lov qabul qilinmaydi ❌", parse_mode="HTML")
+
+@dp.message(Topup.receipt, F.photo)
+async def topup_receipt(m: Message, state: FSMContext):
+    d = await state.get_data(); await state.clear()
+    cur = db.execute("INSERT INTO topups(user_id,amount,ts) VALUES(?,?,?)", (m.from_user.id, d["amount"], time.time())); db.commit(); tid = cur.lastrowid
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ {fmt(d['amount'])} qo'shish", callback_data=f"tok_{tid}"), InlineKeyboardButton(text="❌ Rad etish", callback_data=f"tno_{tid}")]])
+    await bot.send_photo(ADMIN_ID, m.photo[-1].file_id, reply_markup=kb, caption=f"💳 To'ldirish #{tid}\n👤 {m.from_user.full_name} (@{m.from_user.username}, id {m.from_user.id})\nYozgan summa: {fmt(d['amount'])} so'm\n\nBoshqa summa bo'lsa: /add {m.from_user.id} SUMMA")
+    await m.answer("✅ Chek adminga yuborildi. Tasdiqlangach balansingiz to'ldiriladi.")
+
+@dp.message(Topup.receipt)
+async def topup_need_photo(m: Message): await m.answer("Iltimos, chekni RASM sifatida yuboring.")
+
+@dp.callback_query(F.data.regexp(r"^t(ok|no)_\d+$"))
+async def topup_admin(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    act, tid = c.data.split("_"); t = db.execute("SELECT * FROM topups WHERE id=?", (int(tid),)).fetchone()
+    if not t or t["status"] != "kutilmoqda": return await c.answer("Allaqachon ko'rilgan", show_alert=True)
+    if act == "tok":
+        addbal(t["user_id"], t["amount"])
+        db.execute("UPDATE topups SET status='tasdiqlandi' WHERE id=?", (t["id"],)); db.commit()
+        await bot.send_message(t["user_id"], f"✅ Balansingiz {fmt(t['amount'])} so'mga to'ldirildi!")
+        await c.message.edit_caption(caption=(c.message.caption or "") + "\n\n✅ TASDIQLANDI")
+    else:
+        db.execute("UPDATE topups SET status='rad' WHERE id=?", (t["id"],)); db.commit()
+        await bot.send_message(t["user_id"], "❌ To'lovingiz tasdiqlanmadi. Savol bo'lsa: " + CONTACT)
+        await c.message.edit_caption(caption=(c.message.caption or "") + "\n\n❌ RAD ETILDI")
+    await c.answer()
+
+admin_only = lambda m: m.from_user.id == ADMIN_ID
+
+@dp.message(Command("add"))
+async def cmd_add(m: Message, command: CommandObject):
+    if not admin_only(m): return
+    try: uid, amt = map(int, command.args.split())
+    except: return await m.answer("Format: /add USER_ID SUMMA")
+    if not user(uid): return await m.answer("Foydalanuvchi topilmadi")
+    addbal(uid, amt); await bot.send_message(uid, f"✅ Balansingiz {fmt(amt)} so'mga o'zgardi.\nHozir: {fmt(user(uid)['balance'])} so'm")
+    await m.answer("OK")
+
+@dp.message(Command("done"))
+async def cmd_done(m: Message, command: CommandObject):
+    if not admin_only(m) or not (command.args or "").isdigit(): return
+    o = db.execute("SELECT * FROM orders WHERE id=?", (int(command.args),)).fetchone()
+    if not o: return await m.answer("Topilmadi")
+    db.execute("UPDATE orders SET status='bajarildi' WHERE id=?", (o["id"],)); db.commit()
+    await bot.send_message(o["user_id"], f"🎉 Buyurtma #{o['id']} ({o['item']}) bajarildi! Rahmat!"); await m.answer("OK")
+
+@dp.message(Command("refund"))
+async def cmd_refund(m: Message, command: CommandObject):
+    if not admin_only(m) or not (command.args or "").isdigit(): return
+    o = db.execute("SELECT * FROM orders WHERE id=?", (int(command.args),)).fetchone()
+    if not o or o["status"] != "kutilmoqda": return await m.answer("Topilmadi yoki allaqachon ko'rilgan")
+    db.execute("UPDATE orders SET status='qaytarildi' WHERE id=?", (o["id"],)); addbal(o["user_id"], o["price"])
+    await bot.send_message(o["user_id"], f"↩️ Buyurtma #{o['id']} bekor qilindi, {fmt(o['price'])} so'm balansga qaytdi."); await m.answer("OK")
+
+@dp.message(Command("orders"))
+async def cmd_orders(m: Message):
+    if not admin_only(m): return
+    rows = db.execute("SELECT * FROM orders WHERE status='kutilmoqda'").fetchall()
+    await m.answer("\n".join(f"#{o['id']} {o['item']} → {o['target']} ({o['user_id']})" for o in rows) or "Kutilayotgan yo'q")
+
+def admin_kb():
+    on = bot_is_on()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("🟢 Bot: YOQILGAN (o'chirish)" if on else "🔴 Bot: O'CHIRILGAN (yoqish)"), callback_data="adm_toggle")],
+        [InlineKeyboardButton(text="📢 Hammaga xabar (/bc)", callback_data="adm_bc")],
+        [InlineKeyboardButton(text="⛔ ID bloklash", callback_data="adm_block"), InlineKeyboardButton(text="✅ ID blokdan chiqarish", callback_data="adm_unblock")],
+        [InlineKeyboardButton(text="📋 Bloklanganlar ro'yxati", callback_data="adm_list_blocked")],
+        [InlineKeyboardButton(text="📦 Kutilayotgan buyurtmalar", callback_data="adm_orders")],
+        [InlineKeyboardButton(text="🚪 Chiqish", callback_data="adm_exit")],
+    ])
+
+@dp.message(Command("admin"))
+async def admin_entry(m: Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminAuth.password); await m.answer("🔐 Admin panel. Parolni kiriting:")
+
+@dp.message(AdminAuth.password, F.text)
+async def admin_password(m: Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID: return
+    if m.text != ADMIN_PASSWORD: return await m.answer("❌ Parol noto'g'ri.")
+    await state.clear(); await m.answer("✅ Admin panelga xush kelibsiz.", reply_markup=admin_kb())
+
+@dp.callback_query(F.data == "adm_exit")
+async def adm_exit(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    await state.clear(); await c.message.edit_text("Admin paneldan chiqdingiz."); await c.answer()
+
+@dp.callback_query(F.data == "adm_toggle")
+async def adm_toggle(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    set_setting("bot_on", "0" if bot_is_on() else "1")
+    await c.message.edit_reply_markup(reply_markup=admin_kb()); await c.answer("Holat o'zgartirildi")
+
+@dp.callback_query(F.data == "adm_bc")
+async def adm_bc(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    await state.set_state(AdminFlow.broadcast); await c.message.answer("✉️ Hammaga yuboriladigan xabar matnini yozing:"); await c.answer()
+
+@dp.message(AdminFlow.broadcast, F.text)
+async def adm_bc_send(m: Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID: return
+    await state.clear(); rows = db.execute("SELECT id FROM users WHERE blocked=0").fetchall()
+    ok = fail = 0; status = await m.answer(f"Yuborilmoqda... 0/{len(rows)}")
+    for i, r in enumerate(rows, 1):
+        try: await bot.send_message(r["id"], m.text); ok += 1
+        except: fail += 1
+        if i % 25 == 0:
+            try: await status.edit_text(f"Yuborilmoqda... {i}/{len(rows)}")
+            except: pass
+        await asyncio.sleep(0.05)
+    await m.answer(f"✅ Yuborildi: {ok} ta\n❌ Yetib bormadi: {fail} ta", reply_markup=admin_kb())
+
+@dp.message(Command("bc"))
+async def cmd_bc(m: Message, command: CommandObject):
+    if m.from_user.id != ADMIN_ID or not command.args: return
+    rows = db.execute("SELECT id FROM users WHERE blocked=0").fetchall(); ok = fail = 0
+    for r in rows:
+        try: await bot.send_message(r["id"], command.args); ok += 1
+        except: fail += 1
+        await asyncio.sleep(0.05)
+    await m.answer(f"✅ Yuborildi: {ok} ta, ❌ xato: {fail} ta")
+
+@dp.callback_query(F.data == "adm_block")
+async def adm_block(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    await state.set_state(AdminFlow.block_id); await c.message.answer("⛔ Bloklamoqchi bo'lgan foydalanuvchi ID raqamini yuboring:"); await c.answer()
+
+@dp.message(AdminFlow.block_id, F.text)
+async def adm_block_do(m: Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID: return
+    await state.clear()
+    if not m.text.strip().isdigit(): return await m.answer("ID raqam bo'lishi kerak.")
+    uid = int(m.text.strip())
+    if not user(uid): return await m.answer("Bunday foydalanuvchi topilmadi.")
+    db.execute("UPDATE users SET blocked=1 WHERE id=?", (uid,)); db.commit()
+    await m.answer(f"⛔ {uid} bloklandi.", reply_markup=admin_kb())
+
+@dp.callback_query(F.data == "adm_unblock")
+async def adm_unblock(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    await state.set_state(AdminFlow.unblock_id); await c.message.answer("✅ Blokdan chiqarmoqchi bo'lgan ID raqamini yuboring:"); await c.answer()
+
+@dp.message(AdminFlow.unblock_id, F.text)
+async def adm_unblock_do(m: Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID: return
+    await state.clear()
+    if not m.text.strip().isdigit(): return await m.answer("ID raqam bo'lishi kerak.")
+    uid = int(m.text.strip()); db.execute("UPDATE users SET blocked=0 WHERE id=?", (uid,)); db.commit()
+    await m.answer(f"✅ {uid} blokdan chiqarildi.", reply_markup=admin_kb())
+
+@dp.callback_query(F.data == "adm_list_blocked")
+async def adm_list_blocked(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    rows = db.execute("SELECT id, name FROM users WHERE blocked=1").fetchall()
+    text = "\n".join(f"{r['id']} — {r['name']}" for r in rows) or "Bloklangan yo'q"
+    await c.message.answer("⛔ Bloklanganlar:\n" + text); await c.answer()
+
+@dp.callback_query(F.data == "adm_orders")
+async def adm_orders_cb(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID: return await c.answer()
+    rows = db.execute("SELECT * FROM orders WHERE status='kutilmoqda'").fetchall()
+    text = "\n".join(f"#{o['id']} {o['item']} → {o['target']} ({o['user_id']})" for o in rows) or "Kutilayotgan yo'q"
+    await c.answer()
+    await c.message.answer("📦 Kutilayotgan buyurtmalar:\n" + text)
+
+async def main():
+    if not TOKEN or not ADMIN_ID: raise SystemExit("BOT_TOKEN va ADMIN_ID ni o'rnating")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
